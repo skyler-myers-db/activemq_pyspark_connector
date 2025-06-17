@@ -33,12 +33,12 @@ spark: SparkSession = ...
 # 1. Register the custom data source
 spark.dataSource.register(ActiveMQDataSource)
 
-# 2. Define your connection parameters as a (str, int) tuple
+# 2. Define your connection parameters as a (str, int) tuple and topics/queues as a list of strings
 HOSTS_AND_PORTS = [
     ("host1", 61616),
     ("host2", 61616),
 ]
-and topics/queues as a list of strings
+
 QUEUES = ["topic1", "topic2"]
 USERNAME = dbutils.secrets.get(scope="my-scope", key="activemq-username")
 PASSWORD = dbutils.secrets.get(scope="my-scope", key="activemq-password")
