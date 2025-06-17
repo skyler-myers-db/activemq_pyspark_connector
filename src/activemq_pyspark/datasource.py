@@ -1,8 +1,3 @@
-I build a PySpark custom data source stream reader in Databricks so PySpark can read from ActiveMQ. I am connecting multiple hosts/ports in a (str, int) tuple and passing it as a Spark option. For the queues/topics, it is a list of strings also passed as an option. I'm using the STOMP protocol with the Python `stomp.py` library to connect to our ActiveMQ instance. I need you to make this production ready for an enterprise organization. At minimum, you should optimize the code, correct inefficiencies, increase fault-tolerance (such as the ack mode), add logging (using loguru module), add docstring and documentation for instructions on what's going on and how to use, but don't state obvious things, keep comments to a minimum for complex logic only, observability, monitoring, metadata capture/addition, add type hinting for EVERY SINGLE VARIABLE. NO variable should be without a type hint. Remember, this will be run in a PySpark streaming job. I'm using the pyspark.sql.datasource interfaces to override here. Fully understand this before altering anything and be sure not to remove anything that will break something. Justify all your changes. Please also add any other enhancements that I'm forgetting to mention. Ultimately, I'm going to be saving the code to a repo and creating a .whl file to install it on my Spark cluster. Lastly, recommend a Spark cluster to run this and a streaming trigger interval considering I will be getting a few records/second (usually around 5). Here is the PySpark custom datasource on Databricks documentation: https://docs.databricks.com/aws/en/pyspark/datasources#example-2-create-pyspark-datasource-for-streaming-read-and-write
-
-Here is the full current working code to refactor:
-
-```
 import threading
 from datetime import datetime
 import stomp
@@ -17,7 +12,10 @@ from pyspark.sql.types import (
     TimestampType,
     VariantType,
 )
+
 from ast import literal_eval
+from datetime import datetime
+import pytz
 
 
 class ActiveMQPartition(InputPartition):
@@ -52,13 +50,13 @@ class ActiveMQPartition(InputPartition):
 class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def __init__(self, schema: StructType, options: Dict[str, str]):
         stomp.ConnectionListener.__init__(self)
-        self._schema: str = schema
+        self._schema: StructType = schema
         self._options: Dict[str, str] = options
-        self._message: None = None  # satisfy Spark's expectations
+        self._message = None
 
         # Get connection parameters.
         self._broker_hosts_and_ports: str = literal_eval(
-            self._options.get("hps", [("localhost", 61613)])
+            self._options.get("hosts_and_ports", "[('localhost', 61613)]")
         )
         self._broker_queues: List[str] = literal_eval(self._options["queues"])
 
@@ -69,14 +67,14 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._messages: List = (
             []
         )  # will hold tuples: (offset, queue, message, recieved_ts, error)
-        self._lock = threading.Lock()
-        self._conn = stomp.Connection12(
-            host_and_ports=self._broker_hosts_and_ports, heartbeats=(4_000, 4_000)
+        self._lock: threading.Lock = threading.Lock()
+        self._conn: stomp.Connection12 = stomp.Connection12(
+            host_and_ports=self._broker_hosts_and_ports, heartbeats=(10_000, 10_000)
         )
         self._conn.set_listener("ActiveMQReaderListener", self)
         self._conn.connect(self._username, self._password, wait=True)
         for idx, queue in enumerate(self._broker_queues, start=1):
-            print(f"Attempting to connect to queue: '{queue}' with ID: '{id}'")
+            print(f"Attempting to connect to queue: '{queue}' with ID: '{idx}'")
             self._conn.subscribe(
                 destination=queue,
                 id=str(idx),
@@ -84,7 +82,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             )
 
     def __getstate__(self):
-        state = self.__dict__.copy()
+        state: Dict = self.__dict__.copy()
         if "_lock" in state:
             del state["_lock"]
         if "_conn" in state:
@@ -93,8 +91,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self._lock = threading.Lock()
-        self._conn = None
+        self._lock: threading.Lock = threading.Lock()
+        self._conn: Optional[stomp.Connection12] = None
 
     def on_connected(self, frame: stomp.utils.Frame):
         print("Connected to broker")
@@ -114,7 +112,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._current_offset += 1
 
     def on_error(self, frame: stomp.utils.Frame):
-        print(f"Recieved an error: {frame.body}")
+        print(f"Recieved an error: {frame}")
 
     def on_disconnected(self):
         print("Disconnected")
@@ -129,10 +127,12 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             return {"offset": self._current_offset}
 
     def partitions(self, start: dict, end: dict):
+        est = pytz.timezone("US/Eastern")
+        current_est: datetime = datetime.now(est)
         start_offset: int = start.get("offset", 0)
         end_offset: int = end.get("offset", self._current_offset)
         print(
-            f"Creating partition: start_offset={start_offset}, end_offset={end_offset}"
+            f"{current_est}: Creating partition: start_offset={start_offset}, end_offset={end_offset}"
         )
 
         if end_offset < start_offset:
@@ -184,4 +184,3 @@ class ActiveMQDataSource(DataSource):
 
     def streamReader(self, schema: StructType):
         return ActiveMQStreamReader(schema, self.options)
-```
