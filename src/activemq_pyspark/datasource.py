@@ -2,36 +2,10 @@ from __future__ import annotations
 
 """ActiveMQ Structured Streaming source for Apache Spark on Databricks.
 
-This module implements a **DataSource V2** reader that consumes messages from
-ActiveMQ via the STOMP 1.2 protocol and exposes them to Spark as a micro‑batch
-stream. It is designed for **enterprise** usage: typed, well‑documented, fully
-observable, and robust to broker/network failures.
-
-Usage example
--------------
-```python
-(spark.readStream
-     .format("activemq")
-     .option("hosts", "[('mq1.acme.com', 61613), ('mq2.acme.com', 61613)]")
-     .option("queues", "['/queue/orders', '/queue/payments']")
-     .option("username", "svc_reader")
-     .option("password", dbutils.secrets.get(scope="mq", key="svc_reader_pwd"))
-     .load()
-     .writeStream
-     .trigger(processingTime="5 seconds")
-     .option("checkpointLocation", "/mnt/checkpoints/orders")
-     .toTable("raw.orders"))
-```
-
-Options
-~~~~~~~
-``hosts``               – Python literal list of ``(host, port)`` tuples.  
-``queues``              – Python literal list of destinations (queues/topics).  
-``username``/``password`` – Broker credentials.  
-``ack``                 – STOMP ack mode (default ``client-individual``).  
-``heartbeat_out_ms``/``heartbeat_in_ms`` – Custom heart‑beat intervals.
-
-All other parameters are passed through to :pyclass:`stomp.Connection12`.
+This reader consumes messages from ActiveMQ (STOMP 1.2) and surfaces them to
+Spark as a micro‑batch stream with *at‑least‑once* guarantees. All variables
+(including locals) are type‑hinted; logging uses the standard library to remain
+picklable across Spark driver ↔︎ executor boundaries.
 """
 
 ###############################################################################
@@ -39,34 +13,33 @@ All other parameters are passed through to :pyclass:`stomp.Connection12`.
 ###############################################################################
 
 import json
+import logging
 import threading
 from ast import literal_eval
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import (
-    Deque,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Mapping,
-    Optional,
-    Tuple,
-)
+from typing import Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 ###############################################################################
 # Third‑party
 ###############################################################################
 
 import stomp  # type: ignore
-from loguru import logger
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
-__all__ = [
-    "ActiveMQDataSource",
-]
+###############################################################################
+# Logging – stdlib only (picklable)
+###############################################################################
+
+logger: logging.Logger = logging.getLogger(__name__)
+if not logger.handlers:  # Databricks initializes loggers late; be defensive.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+logger.debug("Module imported – logging configured")
 
 ###############################################################################
 # Data model
@@ -75,20 +48,20 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class ActiveMQRecord:
-    """Canonical representation of a single STOMP frame."""
+    """In‑memory representation of one STOMP frame."""
 
     offset: int
-    destination: str
+    frame_cmd: str
     headers: Mapping[str, str]
     body: str
     error: Optional[str]
     received_ts: datetime
 
-    # Convenience converter – used when yielding to Spark executors.
-    def as_row(self) -> Tuple[int, str, str, str, Optional[str]]:
+    def to_row(self) -> Tuple[int, str, str, str, Optional[str]]:
+        """Return the 5‑tuple expected by the downstream Spark schema."""
         return (
             self.offset,
-            self.destination,
+            self.frame_cmd,
             json.dumps(dict(self.headers)),
             self.body,
             self.error,
@@ -96,12 +69,12 @@ class ActiveMQRecord:
 
 
 ###############################################################################
-# Partition – lives on the executors
+# Partition (executors)
 ###############################################################################
 
 
 class ActiveMQPartition(InputPartition):
-    """Represents a slice of offsets for one micro‑batch."""
+    """Spark *InputPartition* backed by a shared in‑process deque."""
 
     def __init__(
         self,
@@ -110,22 +83,23 @@ class ActiveMQPartition(InputPartition):
         shared_buffer: Deque[ActiveMQRecord],
         lock: threading.Lock,
     ) -> None:
-        self._start_offset: int = start_offset
-        self._end_offset: int = end_offset
-        self._buf: Deque[ActiveMQRecord] = shared_buffer
+        self.start_offset: int = start_offset
+        self.end_offset: int = end_offset
+        self._buffer: Deque[ActiveMQRecord] = shared_buffer
         self._lock: threading.Lock = lock
 
     # ------------------------------------------------------------------ #
+    # Spark executor callback
+    # ------------------------------------------------------------------ #
 
     def read(self) -> Iterator[Tuple[int, str, str, str, Optional[str]]]:
-        """Iterates over records in the offset range [start, end)."""
         with self._lock:
-            for rec in list(self._buf):
-                if self._start_offset <= rec.offset < self._end_offset:
-                    yield rec.as_row()
+            for rec in list(self._buffer):
+                if self.start_offset <= rec.offset < self.end_offset:
+                    yield rec.to_row()
 
     # ------------------------------------------------------------------ #
-    # Pickling helpers – Spark serialises the partition to executors.
+    # Pickling helpers – avoid serializing locks across processes
     # ------------------------------------------------------------------ #
 
     def __getstate__(self):  # noqa: D401
@@ -139,29 +113,27 @@ class ActiveMQPartition(InputPartition):
 
 
 ###############################################################################
-# Stream reader – lives on the driver only
+# Stream reader (driver)
 ###############################################################################
 
 
 class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
-    """Implements Spark’s micro‑batch callbacks + STOMP listener hooks."""
-
-    #######################################
-    # Construction
-    #######################################
+    """Structured Streaming reader with *client‑individual* ACK semantics."""
 
     def __init__(self, schema: StructType, options: Dict[str, str]):
         super().__init__()
         stomp.ConnectionListener.__init__(self)
 
+        # ------------------------------------------------------------------ #
+        # Parse options – always type‑annotate locals
+        # ------------------------------------------------------------------ #
         self._schema: StructType = schema
         self._options: Dict[str, str] = options
 
-        # Parse connection options – fallbacks intentionally match ActiveMQ 5.
         hosts: List[Tuple[str, int]] = literal_eval(
             self._options.get("hosts", "[('localhost', 61613)]")
         )
-        self._queues: List[str] = literal_eval(
+        queues: List[str] = literal_eval(
             self._options.get("queues", "['/queue/default']")
         )
 
@@ -169,91 +141,89 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._password: str = self._options.get("password", "password")
         self._ack_mode: str = self._options.get("ack", "client-individual")
 
-        heartbeat_out: int = int(self._options.get("heartbeat_out_ms", "4000"))
-        heartbeat_in: int = int(self._options.get("heartbeat_in_ms", "4000"))
+        hb_out: int = int(self._options.get("heartbeat_out_ms", "4000"))
+        hb_in: int = int(self._options.get("heartbeat_in_ms", "4000"))
 
-        # Runtime state – guarded by _lock.
+        # Shared state guarded by _lock
         self._lock: threading.Lock = threading.Lock()
-        self._records: Deque[ActiveMQRecord] = deque()
+        self._buffer: Deque[ActiveMQRecord] = deque()
         self._pending_acks: Dict[int, Tuple[str, str]] = {}
         self._offset: int = 0
 
-        # Establish connection.
+        # Connection
         self._conn: stomp.Connection12 = stomp.Connection12(
-            hosts,
-            heartbeats=(heartbeat_out, heartbeat_in),
+            hosts, heartbeats=(hb_out, hb_in)
         )
-        self._conn.set_listener("spark-activemq", self)
-        self._connect_and_subscribe()
+        self._conn.set_listener("spark‑activemq", self)
 
-        logger.info(
-            "ActiveMQStreamReader started – hosts={} queues={} ack={}", hosts, self._queues, self._ack_mode
-        )
+        self._connect_and_subscribe(queues)
+        logger.info("ActiveMQStreamReader initialized – hosts=%s queues=%s", hosts, queues)
 
-    #######################################
+    # ------------------------------------------------------------------ #
     # Internal helpers
-    #######################################
+    # ------------------------------------------------------------------ #
 
-    def _connect_and_subscribe(self) -> None:
-        """Connect and subscribe to all requested destinations."""
+    def _connect_and_subscribe(self, queues: List[str]) -> None:
         self._conn.connect(self._username, self._password, wait=True)
-        for idx, dest in enumerate(self._queues, start=1):
-            self._conn.subscribe(destination=dest, id=str(idx), ack=self._ack_mode)
-            logger.debug("Subscribed to {} (id={})", dest, idx)
+        for idx, q in enumerate(queues, start=1):
+            self._conn.subscribe(destination=q, id=str(idx), ack=self._ack_mode)
+            logger.debug("Subscribed to %s (id=%s, ack=%s)", q, idx, self._ack_mode)
 
-    #######################################
+    # ------------------------------------------------------------------ #
     # STOMP callbacks
-    #######################################
+    # ------------------------------------------------------------------ #
 
     def on_connected(self, frame: stomp.utils.Frame):  # noqa: D401
-        logger.info("Connected – broker={}", frame.headers.get("server", "unknown"))
+        logger.info("Connected – broker=%s", frame.headers.get("server", "unknown"))
 
     def on_message(self, frame: stomp.utils.Frame):  # noqa: D401
-        dest: str = frame.headers.get("destination", "unknown")
+        frame_cmd: str = frame.cmd
         try:
-            rec = ActiveMQRecord(
+            rec: ActiveMQRecord = ActiveMQRecord(
                 offset=self._offset,
-                destination=dest,
+                frame_cmd=frame_cmd,
                 headers=frame.headers,
                 body=frame.body,
                 error=None,
                 received_ts=datetime.now(timezone.utc),
             )
             with self._lock:
-                self._records.append(rec)
+                self._buffer.append(rec)
                 self._pending_acks[self._offset] = (
                     frame.headers.get("message-id"),
                     frame.headers.get("subscription"),
                 )
                 self._offset += 1
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Error handling message from {}", dest)
-            bad = ActiveMQRecord(
+            logger.exception("Failed to process frame – cmd=%s", frame_cmd)
+            bad: ActiveMQRecord = ActiveMQRecord(
                 offset=self._offset,
-                destination=dest,
+                frame_cmd=frame_cmd,
                 headers=frame.headers,
                 body=frame.body,
                 error=str(exc),
                 received_ts=datetime.now(timezone.utc),
             )
             with self._lock:
-                self._records.append(bad)
+                self._buffer.append(bad)
                 self._offset += 1
 
     def on_error(self, frame: stomp.utils.Frame):  # noqa: D401
-        logger.error("Broker‑level error: {}", frame.body)
+        logger.error("Broker error – %s", frame.body)
 
     def on_disconnected(self):  # noqa: D401
-        logger.warning("Disconnected – attempting reconnection …")
+        logger.warning("Disconnected – attempting automatic reconnect …")
         try:
-            self._connect_and_subscribe()
+            self._connect_and_subscribe(
+                literal_eval(self._options.get("queues", "['/queue/default']"))
+            )
         except Exception:  # noqa: BLE001
-            logger.critical("Automatic reconnection failed – stream will stop")
+            logger.critical("Reconnection failed – stream will terminate")
             raise
 
-    #######################################
-    # Spark DataSourceStreamReader API
-    #######################################
+    # ------------------------------------------------------------------ #
+    # Spark DataSourceStreamReader interface
+    # ------------------------------------------------------------------ #
 
     def initialOffset(self) -> Dict[str, int]:  # type: ignore[override]
         return {"offset": 0}
@@ -265,22 +235,22 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def partitions(self, start: Dict[str, int], end: Dict[str, int]):  # type: ignore[override]
         start_off: int = start.get("offset", 0)
         end_off: int = end.get("offset", self._offset)
-        logger.debug("Plan partition – {} -> {} ({} buffered)", start_off, end_off, len(self._records))
+        logger.debug("Planning partition – %s → %s", start_off, end_off)
 
         if end_off <= start_off:
             return [ActiveMQPartition(start_off, start_off, deque(), self._lock)]
 
-        return [ActiveMQPartition(start_off, end_off, self._records, self._lock)]
+        return [ActiveMQPartition(start_off, end_off, self._buffer, self._lock)]
 
     def commit(self, end: Dict[str, int]):  # type: ignore[override]
         commit_off: int = end.get("offset", 0)
         with self._lock:
-            while self._records and self._records[0].offset < commit_off:
-                old = self._records.popleft()
-                msg_id, sub = self._pending_acks.pop(old.offset, (None, None))
-                if msg_id and sub:
-                    self._conn.ack(id=msg_id, subscription=sub)
-        logger.debug("Committed up to offset {} ({} pending)", commit_off, len(self._pending_acks))
+            while self._buffer and self._buffer[0].offset < commit_off:
+                old: ActiveMQRecord = self._buffer.popleft()
+                msg_id, subscription = self._pending_acks.pop(old.offset, (None, None))
+                if msg_id and subscription:
+                    self._conn.ack(id=msg_id, subscription=subscription)
+        logger.debug("Committed up to offset %s", commit_off)
 
     def read(
         self, partition: InputPartition
@@ -291,11 +261,11 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         return self._schema
 
     def stop(self):  # type: ignore[override]
-        logger.info("Stopping – disconnecting from broker …")
+        logger.info("Stopping reader – disconnecting from broker…")
         try:
             self._conn.disconnect()
         finally:
-            logger.info("Disconnected from ActiveMQ")
+            logger.info("Disconnected")
 
 
 ###############################################################################
@@ -304,30 +274,23 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
 
 class ActiveMQDataSource(DataSource):
-    """Spark entry‑point – refer to this format as ``activemq``."""
-
-    ######################################################################
-    # Required class methods
-    ######################################################################
+    """Register this source as `format('activemq')`."""
 
     @classmethod
     def name(cls) -> str:  # noqa: D401
         return "activemq"
 
     def schema(self) -> StructType:  # noqa: D401
+        """Fixed schema matching the original definition provided by the user."""
         return StructType(
             [
-                StructField("offset", IntegerType(), nullable=False),
-                StructField("destination", StringType(), nullable=False),
-                StructField("headers", StringType(), nullable=True),
-                StructField("body", StringType(), nullable=True),
-                StructField("error", StringType(), nullable=True),
+                StructField("offset", IntegerType(), False),
+                StructField("frameCmd", StringType(), True),
+                StructField("frameHeaders", StringType(), True),
+                StructField("frameBody", StringType(), True),
+                StructField("messageError", StringType(), True),
             ]
         )
-
-    ######################################################################
-    # Batch interfaces are intentionally unsupported.
-    ######################################################################
 
     def reader(self, schema: StructType):  # noqa: D401
         raise NotImplementedError("Batch reads are not supported for ActiveMQ")
