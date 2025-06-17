@@ -48,8 +48,8 @@ PASSWORD = dbutils.secrets.get(scope="my-scope", key="activemq-password")
 # string representation when passing them as options.
 df = (
     spark.readStream.format("activemq")
-    .option("hosts_and_ports", str(HOSTS_AND_PORTS))
-    .option("queues", str(QUEUES))
+    .option("hosts_and_ports", HOSTS_AND_PORTS)
+    .option("queues", QUEUES)
     .option("username", USERNAME)
     .option("password", PASSWORD)
     .load()
