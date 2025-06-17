@@ -35,8 +35,8 @@ spark.dataSource.register(ActiveMQDataSource)
 
 # 2. Define your connection parameters
 HOSTS_AND_PORTS = [
-    ("message-amq-blue-1.cld..", 61616),
-    ("-message-amq-blue-2.cld.", 61616),
+    ("host1", 61616),
+    ("host2", 61616),
 ]
 QUEUES = ["topic1", "topic2"]
 USERNAME = dbutils.secrets.get(scope="my-scope", key="activemq-username")
