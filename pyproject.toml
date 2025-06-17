@@ -20,6 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "stomp.py>=8.1.0",
+    "loguru>=0.7.3",
 ]
 
 [project.urls]
