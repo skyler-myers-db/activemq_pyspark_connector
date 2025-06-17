@@ -1,9 +1,9 @@
 import ast
 import collections
-import logging
 import threading
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple, Type
+from loguru import logger
 
 import stomp
 from stomp.exception import ConnectFailedException
@@ -16,8 +16,6 @@ from pyspark.sql.types import (
     StructType,
     IntegerType,
 )
-
-_logger: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -46,7 +44,7 @@ class ActiveMQPartitionReader(InputPartition):
         self,
     ) -> Iterator[Tuple[int, Optional[str], str, Optional[str], Optional[str]]]:
         """Yields each message in the partition as a Spark-compatible tuple."""
-        _logger.info(f"Reading partition with {len(self._messages)} messages.")
+        logger.info(f"Reading partition with {len(self._messages)} messages.")
         for msg in self._messages:
             yield msg.to_row()
 
@@ -82,17 +80,17 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             self._username: Optional[str] = self._options.get("username")
             self._password: Optional[str] = self._options.get("password")
         except KeyError as e:
-            _logger.error(f"FATAL: Missing required option: {e}")
+            logger.error(f"FATAL: Missing required option: {e}")
             raise ValueError(f"Missing required option: {e}") from e
         except (ValueError, SyntaxError) as e:
-            _logger.error(f"FATAL: Invalid format for options: {e}")
+            logger.error(f"FATAL: Invalid format for options: {e}")
             raise ValueError(
                 "Options must be valid string representations of Python literals."
             ) from e
 
     def _connect_and_subscribe(self) -> None:
         """Establishes a connection to the broker and subscribes to queues."""
-        _logger.info(f"Initializing STOMP connection to hosts: {self._hosts_and_ports}")
+        logger.info(f"Initializing STOMP connection to hosts: {self._hosts_and_ports}")
         self._conn: stomp.Connection = stomp.Connection(
             host_and_ports=self._hosts_and_ports, heartbeats=(10_000, 10_000)
         )
@@ -100,14 +98,14 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         try:
             self._conn.connect(self._username, self._password, wait=True)
         except ConnectFailedException as e:
-            _logger.error(
+            logger.error(
                 f"FATAL: Failed to connect to ActiveMQ broker: {e}", exc_info=True
             )
             raise
 
     def on_connected(self, frame: Frame) -> None:
         """Called by stomp.py when a connection is established."""
-        _logger.info(f"Successfully connected to broker. Frame: {frame.cmd}")
+        logger.info(f"Successfully connected to broker. Frame: {frame.cmd}")
         if self._conn and self._conn.is_connected():
             for idx, queue in enumerate(self._queues, start=1):
                 sub_id: str = str(idx)
@@ -130,7 +128,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 )
                 self._messages.append(msg)
         except Exception as e:
-            _logger.error(
+            logger.error(
                 f"Error processing received message: {frame.headers}", exc_info=True
             )
             with self._lock:
@@ -148,11 +146,11 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_error(self, frame: Frame) -> None:
         """Called by stomp.py on a protocol error."""
-        _logger.error(f"Received a STOMP protocol error: {frame.body}")
+        logger.error(f"Received a STOMP protocol error: {frame.body}")
 
     def on_disconnected(self) -> None:
         """Called by stomp.py when the connection is lost."""
-        _logger.warning("Disconnected from broker.")
+        logger.warning("Disconnected from broker.")
 
     def initialOffset(self) -> Dict[str, Any]:
         """Returns the initial offset for the stream."""
