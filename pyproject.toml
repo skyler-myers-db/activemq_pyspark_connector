@@ -1,0 +1,27 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "activemq-pyspark-connector"
+version = "1.0.0"
+authors = [
+  { name="Skyler Myers", email="myers_skyler@icloud.com" },
+]
+description = "A PySpark streaming data source for ActiveMQ."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "stomp.py>=8.1.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/skyler-myers-db/activemq-pyspark-connector"
+"Bug Tracker" = "https://github.com/skyler-myers-db/activemq-pyspark-connector/issues"
