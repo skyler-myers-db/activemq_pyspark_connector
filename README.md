@@ -25,7 +25,6 @@ This package is intended to be installed as a library on a Databricks cluster.
 Once the library is installed on your cluster, you must first register the data source with your SparkSession. Then, you can use it in your streaming queries.
 
 ```python
-from pyspark.sql import SparkSession
 from activemq_pyspark import ActiveMQDataSource
 
 # Assuming 'spark' is your active SparkSession
