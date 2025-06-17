@@ -66,8 +66,8 @@ query = (
 
 | Option              | Type                               | Required | Description                                                                                             |
 | ------------------- | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `hosts_and_ports`   | `str(List[Tuple[str, int]])`       | Yes      | A string representation of a list of `(host, port)` tuples for the ActiveMQ brokers.                    |
-| `queues`            | `str(List[str])`                   | Yes      | A string representation of a list of queue names to subscribe to.                                       |
+| `hosts_and_ports`   | `List[Tuple[str, int]]`       | Yes      | A string representation of a list of `(host, port)` tuples for the ActiveMQ brokers.                    |
+| `queues`            | `List[str]`                   | Yes      | A string representation of a list of queue names to subscribe to.                                       |
 | `username`          | `str`                              | No       | The username for authentication.                                                                        |
 | `password`          | `str`                              | No       | The password for authentication.                                                                        |
 
