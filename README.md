@@ -44,8 +44,6 @@ USERNAME = dbutils.secrets.get(scope="my-scope", key="activemq-username")
 PASSWORD = dbutils.secrets.get(scope="my-scope", key="activemq-password")
 
 # 3. Configure and run the stream
-# IMPORTANT: You must convert complex types like lists and tuples to their
-# string representation when passing them as options.
 df = (
     spark.readStream.format("activemq")
     .option("hosts_and_ports", HOSTS_AND_PORTS)
