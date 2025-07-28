@@ -66,10 +66,11 @@ query = (
 
 | Option              | Type                               | Required | Description                                                                                             |
 | ------------------- | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `hosts_and_ports`   | `List[Tuple[str, int]]`       | Yes      | A string representation of a list of `(host, port)` tuples for the ActiveMQ brokers.                    |
-| `queues`            | `List[str]`                   | Yes      | A string representation of a list of queue names to subscribe to.                                       |
+| `hosts_and_ports`   | `list[tuple[str, int]]`       | Yes      | A string representation of a list of `(host, port)` tuples for the ActiveMQ brokers.                    |
+| `queues`            | `list[str]`                   | Yes      | A string representation of a list of queue names to subscribe to.                                       |
 | `username`          | `str`                              | No       | The username for authentication.                                                                        |
 | `password`          | `str`                              | No       | The password for authentication.                                                                        |
+| `heartbeats`          | `int`                              | No       | How often (in milliseconds) to send client heartbeats to the server                                                                   |
 
 ### Output Schema
 
@@ -77,11 +78,11 @@ The streaming DataFrame will have the following schema:
 
 | Column         | Type      | Description                                           |
 | -------------- | --------- | ----------------------------------------------------- |
-| `offset`       | `Integer` | A unique, incrementing ID for each message.           |
-| `frameCmd`     | `String`  | The STOMP command of the frame (e.g., 'MESSAGE').     |
-| `frameHeaders` | `String`  | A string representation of the message headers.       |
-| `frameBody`    | `String`  | The body of the message.                              |
-| `messageError` | `String`  | Populated with an error message if processing failed. |
+| `offset`       | `IntegerType` | A unique, incrementing ID for each message.           |
+| `frameCmd`     | `StringType`  | The STOMP command of the frame (e.g., 'MESSAGE').     |
+| `frameHeaders` | `StringType`  | A string representation of the message headers.       |
+| `frameBody`    | `StringType`  | The body of the message.                              |
+| `messageError` | `StringType`  | Populated with an error message if processing failed. |
 
 ## Development
 
