@@ -1,7 +1,10 @@
-import threading
-from datetime import datetime
 import stomp
-from typing import Iterator, Tuple, List, Dict, Final
+from time import sleep
+from datetime import datetime
+from pytz import timezone
+from typing import Iterator, Final
+from ast import literal_eval
+from threading import Lock
 
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
@@ -12,10 +15,6 @@ from pyspark.sql.types import (
     TimestampType,
     VariantType,
 )
-
-from ast import literal_eval
-from datetime import datetime
-import pytz
 
 
 class ActiveMQPartition(InputPartition):
@@ -43,38 +42,46 @@ class ActiveMQPartition(InputPartition):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self._lock = threading.Lock()
+        self._lock = Lock()
 
 
-# Custom DataSourceStreamReader
 class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
-    def __init__(self, schema: StructType, options: Dict[str, str]):
+    def __init__(self, schema: StructType, options: dict[str, str]):
         stomp.ConnectionListener.__init__(self)
         self._schema: StructType = schema
-        self._options: Dict[str, str] = options
+        self._options: dict[str, str] = options
         self._message = None
+        self._conn: stomp.Connection12 | None = None
+        self._heartbeats: int = int(self._options.get("heartbeats", 5_000))
 
-        # Get connection parameters.
         self._broker_hosts_and_ports: str = literal_eval(
             self._options.get("hosts_and_ports", "[('localhost', 61613)]")
         )
-        self._broker_queues: List[str] = literal_eval(self._options["queues"])
+        self._broker_queues: list[str] = literal_eval(self._options["queues"])
 
         self._username: str = self._options.get("username", "admin")
         self._password: str = self._options.get("password", "password")
 
         self._current_offset: int = 0
-        self._messages: List = (
+        self._messages: list[tuple[int, str, str, str, str | None]] = (
             []
         )  # will hold tuples: (offset, queue, message, recieved_ts, error)
-        self._lock: threading.Lock = threading.Lock()
-        self._conn: stomp.Connection12 = stomp.Connection12(
-            host_and_ports=self._broker_hosts_and_ports, heartbeats=(10_000, 10_000)
-        )
-        self._conn.set_listener("ActiveMQReaderListener", self)
+        self._lock: Lock = Lock()
+        self._connect_and_subscribe()
+
+    def _connect_and_subscribe(self):
+        """Connects to the broker and subscribes to queues."""
+        if not self._conn:
+            self._conn = stomp.Connection12(
+                host_and_ports=self._broker_hosts_and_ports,
+                heartbeats=(self._heartbeats, self._heartbeats),
+            )
+            self._conn.set_listener("ActiveMQReaderListener", self)
+
+        print("INFO: Attempting to connect to broker...")
         self._conn.connect(self._username, self._password, wait=True)
         for idx, queue in enumerate(self._broker_queues, start=1):
-            print(f"Attempting to connect to queue: '{queue}' with ID: '{idx}'")
+            print(f"INFO: Attempting to subscribe to queue: '{queue}' with ID: '{idx}'")
             self._conn.subscribe(
                 destination=queue,
                 id=str(idx),
@@ -82,7 +89,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             )
 
     def __getstate__(self):
-        state: Dict = self.__dict__.copy()
+        state: dict = self.__dict__.copy()
         if "_lock" in state:
             del state["_lock"]
         if "_conn" in state:
@@ -90,12 +97,16 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         return state
 
     def __setstate__(self, state):
+        """Ensure connection is re-established after deserialization on the driver."""
         self.__dict__.update(state)
-        self._lock: threading.Lock = threading.Lock()
-        self._conn: Optional[stomp.Connection12] = None
+        self._lock: Lock = Lock()
+        self._conn: stomp.Connection12 | None = None
+        self._connect_and_subscribe()
 
     def on_connected(self, frame: stomp.utils.Frame):
-        print("Connected to broker")
+        print(
+            "SUCCESS: on_connected: ----------------Connected to broker----------------"
+        )
 
     def on_message(self, frame: stomp.utils.Frame):
         try:
@@ -112,10 +123,23 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._current_offset += 1
 
     def on_error(self, frame: stomp.utils.Frame):
-        print(f"Recieved an error: {frame}")
+        print(
+            f"ERROR: on_error: ----------------Recieved an error: '{frame}'----------------"
+        )
 
     def on_disconnected(self):
-        print("Disconnected")
+        """Called by stomp.py when the connection is lost."""
+        print(
+            "ERROR: on_disconnected: ----------------Disconnected from broker. Attempting to reconnect...----------------"
+        )
+        while not self._conn.is_connected():
+            try:
+                time.sleep(5)
+                self._connect_and_subscribe()
+            except Exception as e:
+                print(
+                    f"ERROR: on_disconnected: ----------------Reconnect failed: {e}----------------"
+                )
 
     def initialOffset(self) -> dict:
         return {"offset": 0}
@@ -127,7 +151,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             return {"offset": self._current_offset}
 
     def partitions(self, start: dict, end: dict):
-        est = pytz.timezone("US/Eastern")
+        est = timezone("America/New_York")
         current_est: datetime = datetime.now(est)
         start_offset: int = start.get("offset", 0)
         end_offset: int = end.get("offset", self._current_offset)
@@ -136,7 +160,9 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         )
 
         if end_offset < start_offset:
-            print("No new messages, returning dummy partition.")
+            print(
+                "WARNING: ----------------No new messages, returning dummy partition.----------------"
+            )
             return [ActiveMQPartition(start_offset, start_offset + 1, [], self._lock)]
 
         return [ActiveMQPartition(start_offset, end_offset, self._messages, self._lock)]
@@ -150,7 +176,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 if off >= commit_offset
             ]
 
-    def read(self, partition: InputPartition) -> Iterator[Tuple]:
+    def read(self, partition: InputPartition) -> Iterator[tuple]:
         return partition.read()
 
     def schema(self) -> StructType:
@@ -179,7 +205,7 @@ class ActiveMQDataSource(DataSource):
 
     def reader(self, schema: StructType):
         raise NotImplementedError(
-            "Batch queries are not supported for ActiveMQDataSource"
+            "ERROR: ----------------Batch queries are not supported for ActiveMQDataSource.----------------"
         )
 
     def streamReader(self, schema: StructType):
