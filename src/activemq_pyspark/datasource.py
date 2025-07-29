@@ -25,7 +25,7 @@ class ActiveMQPartition(InputPartition):
         self._lock = lock
 
     def read(self):
-        for message in partition_data:
+        for message in self._messages:
             yield message  # (offset, queue, message, ts, error)
 
     def __getstate__(self):
