@@ -25,12 +25,6 @@ class ActiveMQPartition(InputPartition):
         self._lock = lock
 
     def read(self):
-        with self._lock:
-            partition_data = [
-                record
-                for record in self._messages
-                if self.start_offset <= record[0] < self.end_offset
-            ]
         for message in partition_data:
             yield message  # (offset, queue, message, ts, error)
 
@@ -105,7 +99,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_connected(self, frame: stomp.utils.Frame):
         print(
-            "SUCCESS: on_connected: ----------------Connected to broker----------------"
+            f"SUCCESS: on_connected: ----------------Connected to broker: '{frame}'----------------\n"
         )
 
     def on_message(self, frame: stomp.utils.Frame):
@@ -155,9 +149,9 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         current_est: datetime = datetime.now(est)
         start_offset: int = start.get("offset", 0)
         end_offset: int = end.get("offset", self._current_offset)
-        print(
-            f"{current_est}: Creating partition: start_offset={start_offset}, end_offset={end_offset}"
-        )
+        # print(
+        #     f"{current_est}: Creating partition: start_offset={start_offset}, end_offset={end_offset}"
+        # )
 
         if end_offset < start_offset:
             print(
@@ -165,7 +159,16 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             )
             return [ActiveMQPartition(start_offset, start_offset + 1, [], self._lock)]
 
-        return [ActiveMQPartition(start_offset, end_offset, self._messages, self._lock)]
+        # Filter the messages on the driver BEFORE creating the partition object.
+        with self._lock:
+            partition_data: list = [
+                record
+                for record in self._messages
+                if start_offset <= record[0] < end_offset
+            ]
+
+        # Now pass the much smaller, self-contained list to the partition.
+        return [ActiveMQPartition(start_offset, end_offset, partition_data, self._lock)]
 
     def commit(self, end: dict):
         commit_offset: int = end.get("offset", 0)
