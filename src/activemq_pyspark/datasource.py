@@ -128,7 +128,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         )
         while not self._conn.is_connected():
             try:
-                time.sleep(5)
+                sleep(5)
                 self._connect_and_subscribe()
             except Exception as e:
                 print(
