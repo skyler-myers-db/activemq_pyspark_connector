@@ -4,6 +4,7 @@ from datetime import datetime
 from pytz import timezone
 from typing import Iterator, Final
 from ast import literal_eval
+from collections import deque
 from threading import Lock
 
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
@@ -44,7 +45,6 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         stomp.ConnectionListener.__init__(self)
         self._schema: StructType = schema
         self._options: dict[str, str] = options
-        self._message = None
         self._conn: stomp.Connection12 | None = None
         self._heartbeats: int = int(self._options.get("heartbeats", 5_000))
 
@@ -57,9 +57,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._password: str = self._options.get("password", "password")
 
         self._current_offset: int = 0
-        self._messages: list[tuple[int, str, str, str, str | None]] = (
-            []
-        )  # will hold tuples: (offset, queue, message, recieved_ts, error)
+        self._messages: deque = deque()  # will hold tuples: (offset, queue, message, recieved_ts, error)
         self._lock: Lock = Lock()
         self._connect_and_subscribe()
 
@@ -173,11 +171,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def commit(self, end: dict):
         commit_offset: int = end.get("offset", 0)
         with self._lock:
-            self._messages = [
-                (off, cmd, headers, body, err)
-                for (off, cmd, headers, body, err) in self._messages
-                if off >= commit_offset
-            ]
+            while self._messages and self._messages[0][0] < commit_offset:
+                self._messages.popleft()
 
     def read(self, partition: InputPartition) -> Iterator[tuple]:
         return partition.read()
