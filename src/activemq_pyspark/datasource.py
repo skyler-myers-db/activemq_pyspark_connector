@@ -57,7 +57,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._password: str = self._options.get("password", "password")
 
         self._current_offset: int = 0
-        self._messages: deque = deque()  # will hold tuples: (offset, queue, message, recieved_ts, error)
+        self._messages: dict[int, tuple] = {} # will hold tuples: (offset, queue, message, recieved_ts, error)
         self._lock: Lock = Lock()
         self._connect_and_subscribe()
 
@@ -102,16 +102,12 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_message(self, frame: stomp.utils.Frame):
         try:
-            with self._lock:
-                self._messages.append(
-                    (self._current_offset, frame.cmd, frame.headers, frame.body, None)
-                )
+            message_tuple: tuple[int, str, str, str, None] = (self._current_offset, frame.cmd, frame.headers, frame.body, None)
         except Exception as e:
             # If an error occurs during message processing, capture error message.
-            with self._lock:
-                self._messages.append(
-                    (self._current_offset, frame.cmd, frame.headers, frame.body, str(e))
-                )
+            message_tuple: tuple[int, str, str, str, str] = (self._current_offset, frame.cmd, frame.headers, frame.body, str(e))
+        with self._lock:
+            self._messages[self._current_offset] = message_tuple
         self._current_offset += 1
 
     def on_error(self, frame: stomp.utils.Frame):
@@ -159,10 +155,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
         # Filter the messages on the driver BEFORE creating the partition object.
         with self._lock:
-            partition_data: list = [
-                record
-                for record in self._messages
-                if start_offset <= record[0] < end_offset
+            partition_data: list[tuple[int, str, str, str, str | None]] = [
+                self._messages[offset]
+                for offset in range(start_offset, end_offset)
+                if offset in self._messages
             ]
 
         # Now pass the much smaller, self-contained list to the partition.
@@ -171,8 +167,9 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def commit(self, end: dict):
         commit_offset: int = end.get("offset", 0)
         with self._lock:
-            while self._messages and self._messages[0][0] < commit_offset:
-                self._messages.popleft()
+            keys_to_delete: tuple[int] = tuple(offset for offset in self._messages if offset < commit_offset)
+            for offset in keys_to_delete:
+                del self._messages[offset]
 
     def read(self, partition: InputPartition) -> Iterator[tuple]:
         return partition.read()
