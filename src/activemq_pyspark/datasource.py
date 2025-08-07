@@ -469,7 +469,9 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             dict[str, int]: A dictionary where keys are queue names and values
                 are the initial offset (0) for each queue.
         """
-        return {q: 0 for q in self._queues}
+        initial_offsets = {q: 0 for q in self._queues}
+        log.debug("Initial offsets: %s", initial_offsets)
+        return initial_offsets
 
     def latestOffset(self: "ActiveMQStreamReader") -> dict[str, int]:
         """
@@ -485,10 +487,18 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         # Ensure connection is active before reporting offsets
         if not self._connection or not self._connection.is_connected():
             log.warning("Connection lost, attempting to reconnect...")
-            self._connect()
+            try:
+                self._connect()
+            except Exception as e:
+                log.error("Failed to reconnect: %s", e)
 
         with self._lock:
-            return self._offset_by_queue.copy()
+            # Ensure all configured queues have offset entries, even if no messages received
+            result = {}
+            for queue in self._queues:
+                result[queue] = self._offset_by_queue[queue]
+            log.debug("Latest offsets: %s", result)
+            return result
 
     def partitions(
         self: "ActiveMQStreamReader",
@@ -519,6 +529,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             access to the message buffer during partition creation.
         """
         partitions: list[ActiveMQPartition] = []
+        log.debug("Creating partitions with start=%s, end=%s", start, end)
         with self._lock:
             for queue in self._queues:
                 starting_offset = start.get(queue, 0)
@@ -539,6 +550,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 ]
                 if rows:
                     partitions.append(ActiveMQPartition(queue, rows))
+
+        # Always return at least one partition to prevent empty partition issues
         return partitions or [ActiveMQPartition("__empty__", [])]
 
     def _is_committed(
