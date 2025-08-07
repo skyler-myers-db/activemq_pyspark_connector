@@ -357,9 +357,6 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                         )
                     )
 
-        print(
-            f"{self._get_est_timestamp()}: INFO: Created {len(partitions)} partition(s) with {len(partition_data)} messages (offsets {start_offset} to {end_offset})"
-        )
         return partitions
 
     def commit(self, end: dict[str, int]) -> None:
