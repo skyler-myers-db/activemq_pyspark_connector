@@ -667,6 +667,65 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         """
         return self._schema
 
+    def __getstate__(self):
+        """
+        Custom serialization method for pickling the ActiveMQStreamReader.
+
+        This method is called when the object needs to be serialized (pickled)
+        for distribution to Spark workers. It excludes non-serializable objects
+        like threading.Lock and STOMP connections.
+
+        Returns:
+            dict: A dictionary containing only the serializable state of the object.
+        """
+        state = self.__dict__.copy()
+        # Remove non-serializable objects
+        state["_lock"] = None
+        state["_connection"] = None
+        state["_pending_ack"] = None  # STOMP frames are not serializable
+        state["_frame_to_offset"] = {}  # Clear frame references
+        return state
+
+    def __setstate__(self, state):
+        """
+        Custom deserialization method for unpickling the ActiveMQStreamReader.
+
+        This method is called when the object is deserialized (unpickled)
+        on Spark workers. It reconstructs the non-serializable objects.
+
+        Args:
+            state (dict): The serialized state dictionary.
+        """
+        self.__dict__.update(state)
+        # Recreate non-serializable objects
+        self._lock = Lock()
+        self._pending_ack = deque(maxlen=MAX_QUEUE_BUFFER)
+        self._frame_to_offset = {}
+        self._connection = None
+        self._is_stopped = False
+
+        # Recreate connection if we have the necessary info
+        if hasattr(self, "_reader_options") and self._reader_options:
+            try:
+                hosts = literal_eval(self._reader_options["hosts_and_ports"])
+                self._connection = stomp.Connection12(
+                    hosts, heartbeats=(HEARTBEAT_MS, HEARTBEAT_MS)
+                )
+                self._connection.set_listener("ActiveMQListener", self)
+                self._connect()
+            except (
+                ValueError,
+                SyntaxError,
+                TypeError,
+                KeyError,
+                stomp.exception.ConnectFailedException,
+                ConnectionError,
+                OSError,
+            ) as error:
+                log.warning(
+                    "Failed to recreate connection after deserialization: %s", error
+                )
+
     def stop(self: "ActiveMQStreamReader") -> None:
         """
         Stop the ActiveMQ stream reader and disconnect from the broker.
