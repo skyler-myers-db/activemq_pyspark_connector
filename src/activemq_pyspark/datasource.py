@@ -105,20 +105,19 @@ class ActiveMQPartition(InputPartition):
     def __init__(
         self: "ActiveMQPartition",
         queue: str,
-        rows: list[tuple[int, str, str, str, str | None]],
+        rows: list[tuple[str, str, str, int]],
     ) -> None:
         """
         Initialize an ActiveMQPartition instance.
 
         Args:
             queue (str): The name of the ActiveMQ queue.
-            rows (list[tuple[int, str, str, str, str | None]]):
+            rows (list[tuple[str, str, str, int]]):
                 List of tuples containing message data. Each tuple contains:
-                - int: Message sequence number or identifier (offset)
-                - str: STOMP frame command
-                - str: JSON-encoded message headers
+                - str: Queue name
                 - str: Message body/content
-                - str | None: Optional error message if processing failed
+                - str: JSON-encoded message headers
+                - int: Message offset
 
         Returns:
             None
@@ -187,6 +186,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         _queues (list[str]): List of ActiveMQ queues to subscribe to
         _offset_by_queue (defaultdict[str, int]): Current offset tracking per queue
         _message_buffer_by_queue (dict[str, deque[tuple]]): In-memory message buffers per queue
+            Each tuple contains: (queue, body, headers_json, offset)
         _lock (Lock): Thread synchronization lock for buffer operations
         _connection (stomp.Connection12): STOMP connection to ActiveMQ broker
         _user (str): Username for broker authentication
@@ -315,7 +315,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         """Handle incoming STOMP frame messages from ActiveMQ.
 
         Processes incoming messages by extracting the destination queue, creating a message
-        tuple with offset, command, headers, body, and error information, then buffering
+        tuple with queue, body, headers, and offset information, then buffering
         the message for consumption by the stream reader.
 
         Args:
@@ -323,7 +323,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
         Note:
             This method is thread-safe and uses a lock when modifying shared state.
-            Any errors during message processing are caught and included in the message tuple.
+            Any errors during message processing are caught and logged.
         """
         queue: str = frame.headers["destination"]
 
@@ -332,21 +332,27 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             self._frame_to_offset[frame] = current_offset
 
             try:
-                message: tuple[int, str, str, str, str | None] = (
-                    current_offset,
-                    frame.cmd,
-                    json.dumps(frame.headers),
+                # Create tuple matching the schema: (queue, body, headers, offset)
+                # This matches the StructType schema we defined
+                message: tuple[str, str, str, int] = (
+                    queue,
                     frame.body or "",
-                    None,
+                    json.dumps(frame.headers) if frame.headers else "{}",
+                    current_offset,
+                )
+                log.debug(
+                    "Processed message: queue=%s, offset=%d, body_length=%d",
+                    queue,
+                    current_offset,
+                    len(frame.body) if frame.body else 0,
                 )
             except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
                 log.error("Error processing message: %s", error, exc_info=True)
                 message = (
-                    current_offset,
-                    getattr(frame, "cmd", "UNKNOWN"),
+                    queue,
+                    "",
                     json.dumps(frame.headers) if hasattr(frame, "headers") else "{}",
-                    frame.body or "",
-                    str(error),
+                    current_offset,
                 )
 
             self._message_buffer_by_queue[queue].append(message)
@@ -469,7 +475,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             dict[str, int]: A dictionary where keys are queue names and values
                 are the initial offset (0) for each queue.
         """
-        initial_offsets = {q: 0 for q in self._queues}
+        # Ensure we have entries for all queues, even if no messages received yet
+        initial_offsets = {}
+        for queue in self._queues:
+            initial_offsets[queue] = 0
         log.debug("Initial offsets: %s", initial_offsets)
         return initial_offsets
 
@@ -543,10 +552,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 if starting_offset >= ending_offset:
                     continue
 
-                rows: list[tuple[int, str, str, str, str | None]] = [
+                rows: list[tuple[str, str, str, int]] = [
                     row
                     for row in self._message_buffer_by_queue[queue]
-                    if starting_offset <= row[0] < ending_offset
+                    if starting_offset <= row[3] < ending_offset  # row[3] is the offset
                 ]
                 if rows:
                     partitions.append(ActiveMQPartition(queue, rows))
@@ -573,13 +582,18 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 queue, indicating the message has been committed. False otherwise.
                 Returns False if the queue is not found in end_offsets.
         """
-        queue: str = frame.headers["destination"]
-        # CRITICAL FIX: The frame doesn't have an "offset" header - we need to track this ourselves
-        # Use a mapping from frame to our internal offset
-        message_offset: int = self._frame_to_offset.get(frame, -1)
-        if message_offset == -1:
-            return False  # Unknown frame, don't commit
-        return message_offset < end_offsets.get(queue, 0)
+        try:
+            queue: str = frame.headers["destination"]
+            # CRITICAL FIX: The frame doesn't have an "offset" header - we need to track this ourselves
+            # Use a mapping from frame to our internal offset
+            message_offset: int = self._frame_to_offset.get(frame, -1)
+            if message_offset == -1:
+                log.debug("Frame not found in offset mapping")
+                return False  # Unknown frame, don't commit
+            return message_offset < end_offsets.get(queue, 0)
+        except (KeyError, AttributeError, TypeError) as e:
+            log.error("Error checking if frame is committed: %s", e)
+            return False
 
     def commit(self: "ActiveMQStreamReader", end: dict[str, int]) -> None:
         """
@@ -598,14 +612,31 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             This method is thread-safe and uses an internal lock to ensure atomic
             operations on the message buffers.
         """
+        log.debug("Committing offsets: %s", end)
+
+        # Validate that end offsets contain expected queue names
+        if not end:
+            log.warning("Empty end offsets received in commit")
+            return
+
+        # Check for missing queue names in end offsets
+        missing_queues = set(self._queues) - set(end.keys())
+        if missing_queues:
+            log.warning("Missing queues in end offsets: %s", missing_queues)
+
         with self._lock:
             # Clean up message buffers
             for queue, offset in end.items():
-                message_buffer: deque[tuple[int, str, str, str, str | None]] = (
-                    self._message_buffer_by_queue[queue]
-                )
-                while message_buffer and message_buffer[0][0] < offset:
-                    message_buffer.popleft()
+                if queue in self._message_buffer_by_queue:
+                    message_buffer: deque[tuple[str, str, str, int]] = (
+                        self._message_buffer_by_queue[queue]
+                    )
+                    while (
+                        message_buffer and message_buffer[0][3] < offset
+                    ):  # row[3] is offset
+                        message_buffer.popleft()
+                else:
+                    log.warning("Unknown queue in commit: %s", queue)
 
             # Acknowledge frames and clean up tracking
             committed_frames = []
