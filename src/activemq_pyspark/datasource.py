@@ -1,5 +1,4 @@
 """
-
 This module provides a comprehensive data source implementation for integrating Apache ActiveMQ
 with Apache Spark's Structured Streaming framework. It enables real-time message consumption
 from ActiveMQ queues with support for parallel processing, fault tolerance, and exactly-once
@@ -75,6 +74,7 @@ from pyspark.sql.types import StructType, StringType, IntegerType, StructField
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s: %(message)s"
 )
+logging.getLogger("py4j").setLevel(logging.ERROR)  # Suppress Py4J warnings
 log = logging.getLogger(__name__)
 
 # ─────────────────────────── constants ────────────────────────────
@@ -222,7 +222,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._message_buffer_by_queue: dict[str, deque[tuple]] = {
             queue: deque(maxlen=MAX_QUEUE_BUFFER) for queue in self._queues
         }
-        self._pending_ack: deque[stomp.utils.Frame] = deque()
+        self._pending_ack: deque[stomp.utils.Frame] = deque(maxlen=MAX_QUEUE_BUFFER)
         self._frame_to_offset: dict[stomp.utils.Frame, int] = {}
         self._lock: Lock = Lock()
         self._connection: stomp.Connection12 | None = None
@@ -329,23 +329,22 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
         with self._lock:
             current_offset = self._offset_by_queue[queue]
-            # Track frame to offset mapping for proper acknowledgment
             self._frame_to_offset[frame] = current_offset
 
             try:
                 message: tuple[int, str, str, str, str | None] = (
                     current_offset,
-                    frame.command,
+                    frame.cmd,
                     json.dumps(frame.headers),
-                    frame.body or "",  # Ensure body is never None
+                    frame.body or "",
                     None,
                 )
             except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
                 log.error("Error processing message: %s", error, exc_info=True)
                 message = (
                     current_offset,
-                    frame.command,
-                    json.dumps(frame.headers),
+                    getattr(frame, "cmd", "UNKNOWN"),
+                    json.dumps(frame.headers) if hasattr(frame, "headers") else "{}",
                     frame.body or "",
                     str(error),
                 )
@@ -353,6 +352,20 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             self._message_buffer_by_queue[queue].append(message)
             self._offset_by_queue[queue] += 1
             self._pending_ack.append(frame)
+
+            # Periodic cleanup to prevent unbounded growth of frame mapping
+            # Clean up if the mapping grows too large (safety mechanism)
+            if len(self._frame_to_offset) > MAX_QUEUE_BUFFER * len(self._queues):
+                # Keep only the most recent MAX_QUEUE_BUFFER entries per queue
+                max_keep = MAX_QUEUE_BUFFER * len(self._queues) // 2
+                if len(self._frame_to_offset) > max_keep:
+                    # Sort by offset and keep the highest offsets
+                    sorted_items = sorted(
+                        self._frame_to_offset.items(), key=lambda x: x[1]
+                    )
+                    items_to_remove = sorted_items[:-max_keep]
+                    for frame, _ in items_to_remove:
+                        self._frame_to_offset.pop(frame, None)
 
     def on_connected(
         self: "ActiveMQStreamReader",
@@ -509,7 +522,16 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         with self._lock:
             for queue in self._queues:
                 starting_offset = start.get(queue, 0)
-                ending_offset = min(end[queue], starting_offset + MAX_OFFSETS_BUFFER)
+                # Handle case where end offset may not exist for a queue
+                queue_end_offset = end.get(queue, starting_offset)
+                ending_offset = min(
+                    queue_end_offset, starting_offset + MAX_OFFSETS_BUFFER
+                )
+
+                # Skip if there's no range to process
+                if starting_offset >= ending_offset:
+                    continue
+
                 rows: list[tuple[int, str, str, str, str | None]] = [
                     row
                     for row in self._message_buffer_by_queue[queue]
@@ -599,6 +621,18 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             # Clean up frame-to-offset mapping for committed frames
             for frame in committed_frames:
                 self._frame_to_offset.pop(frame, None)
+
+            # Additional cleanup: remove any frame mappings for offsets below the minimum committed offset
+            # This prevents unbounded growth when Spark lags behind message arrival
+            if end:
+                min_committed_offset = min(end.values())
+                frames_to_remove = [
+                    frame
+                    for frame, offset in self._frame_to_offset.items()
+                    if offset < min_committed_offset
+                ]
+                for frame in frames_to_remove:
+                    self._frame_to_offset.pop(frame, None)
 
     def read(self, partition: InputPartition) -> Iterator[tuple]:
         """
