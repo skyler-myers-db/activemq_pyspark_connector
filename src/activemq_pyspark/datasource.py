@@ -105,19 +105,20 @@ class ActiveMQPartition(InputPartition):
     def __init__(
         self: "ActiveMQPartition",
         queue: str,
-        rows: list[tuple[str, str, str, int]],
+        rows: list[tuple[int, str, str, str, str | None]],
     ) -> None:
         """
         Initialize an ActiveMQPartition instance.
 
         Args:
             queue (str): The name of the ActiveMQ queue.
-            rows (list[tuple[str, str, str, int]]):
+            rows (list[tuple[int, str, str, str, str | None]]):
                 List of tuples containing message data. Each tuple contains:
-                - str: Queue name
-                - str: Message body/content
-                - str: JSON-encoded message headers
                 - int: Message offset
+                - str: STOMP frame command
+                - str: JSON-encoded message headers
+                - str: Message body/content
+                - str | None: Optional error message if processing failed
 
         Returns:
             None
@@ -186,7 +187,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         _queues (list[str]): List of ActiveMQ queues to subscribe to
         _offset_by_queue (defaultdict[str, int]): Current offset tracking per queue
         _message_buffer_by_queue (dict[str, deque[tuple]]): In-memory message buffers per queue
-            Each tuple contains: (queue, body, headers_json, offset)
+            Each tuple contains: (offset, frameCmd, frameHeaders, frameBody, messageError)
         _lock (Lock): Thread synchronization lock for buffer operations
         _connection (stomp.Connection12): STOMP connection to ActiveMQ broker
         _user (str): Username for broker authentication
@@ -332,13 +333,14 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             self._frame_to_offset[frame] = current_offset
 
             try:
-                # Create tuple matching the schema: (queue, body, headers, offset)
-                # This matches the StructType schema we defined
-                message: tuple[str, str, str, int] = (
-                    queue,
-                    frame.body or "",
-                    json.dumps(frame.headers) if frame.headers else "{}",
+                # Create tuple matching the schema: (offset, frameCmd, frameHeaders, frameBody, messageError)
+                # This matches the 5-column StructType schema we defined
+                message: tuple[int, str, str, str, str | None] = (
                     current_offset,
+                    frame.cmd,
+                    json.dumps(frame.headers) if frame.headers else "{}",
+                    frame.body or "",
+                    None,
                 )
                 log.debug(
                     "Processed message: queue=%s, offset=%d, body_length=%d",
@@ -349,10 +351,11 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
                 log.error("Error processing message: %s", error, exc_info=True)
                 message = (
-                    queue,
-                    "",
-                    json.dumps(frame.headers) if hasattr(frame, "headers") else "{}",
                     current_offset,
+                    getattr(frame, "cmd", "UNKNOWN"),
+                    json.dumps(frame.headers) if hasattr(frame, "headers") else "{}",
+                    frame.body or "",
+                    str(error),
                 )
 
             self._message_buffer_by_queue[queue].append(message)
@@ -552,10 +555,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 if starting_offset >= ending_offset:
                     continue
 
-                rows: list[tuple[str, str, str, int]] = [
+                rows: list[tuple[int, str, str, str, str | None]] = [
                     row
                     for row in self._message_buffer_by_queue[queue]
-                    if starting_offset <= row[3] < ending_offset  # row[3] is the offset
+                    if starting_offset <= row[0] < ending_offset  # row[0] is the offset
                 ]
                 if rows:
                     partitions.append(ActiveMQPartition(queue, rows))
@@ -628,12 +631,12 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             # Clean up message buffers
             for queue, offset in end.items():
                 if queue in self._message_buffer_by_queue:
-                    message_buffer: deque[tuple[str, str, str, int]] = (
+                    message_buffer: deque[tuple[int, str, str, str, str | None]] = (
                         self._message_buffer_by_queue[queue]
                     )
                     while (
-                        message_buffer and message_buffer[0][3] < offset
-                    ):  # row[3] is offset
+                        message_buffer and message_buffer[0][0] < offset
+                    ):  # row[0] is offset
                         message_buffer.popleft()
                 else:
                     log.warning("Unknown queue in commit: %s", queue)
