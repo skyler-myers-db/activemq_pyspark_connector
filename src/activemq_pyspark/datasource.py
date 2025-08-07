@@ -353,7 +353,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                     chunk_end_offset = chunk_data[-1][0] + 1
                     partitions.append(
                         ActiveMQPartition(
-                            chunk_start_offset, chunk_end_offset, chunk_data, self._lock
+                            chunk_start_offset,
+                            chunk_end_offset,
+                            chunk_data,
+                            self._lock,
                         )
                     )
 

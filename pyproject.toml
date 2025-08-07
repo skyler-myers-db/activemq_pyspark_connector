@@ -1,27 +1,172 @@
 # pyproject.toml
 
 [build-system]
-requires = ["setuptools>=74.0.0"]
+requires = ["setuptools>=80.9.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "activemq-pyspark-connector"
-version = "1.0.4"
-description = "A PySpark streaming data source for ActiveMQ."
+version = "1.0.5"
+description = "A high-performance PySpark streaming data source for ActiveMQ with TTL protection and hybrid memory management."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10.12"
 authors = [{ name = "Skyler Myers", email = "myers_skyler@icloud.com" }]
+maintainers = [{ name = "Skyler Myers", email = "myers_skyler@icloud.com" }]
 
 license = "MIT"
 license-files = ["LICENSE*"]
 
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "Operating System :: OS Independent",
+keywords = [
+    "pyspark",
+    "activemq",
+    "streaming",
+    "data-source", 
+    "stomp",
+    "real-time",
+    "message-queue",
+    "big-data"
 ]
 
-dependencies = ["stomp.py>=8.2.0"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Data Engineers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11", 
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Internet :: Messaging",
+    "Environment :: Web Environment",
+    "Framework :: Apache Spark"
+]
+
+dependencies = [
+    "stomp.py>=8.2.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.7.0",
+    "mypy>=1.5.0",
+    "ruff>=0.0.280",
+    "pre-commit>=3.3.0"
+]
+test = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.11.0"
+]
+docs = [
+    "sphinx>=7.0.0",
+    "sphinx-rtd-theme>=1.3.0",
+    "myst-parser>=2.0.0"
+]
 
 [project.urls]
 Homepage = "https://github.com/skyler-myers-db/activemq-pyspark-connector"
+Repository = "https://github.com/skyler-myers-db/activemq-pyspark-connector.git"
 "Bug Tracker" = "https://github.com/skyler-myers-db/activemq-pyspark-connector/issues"
+Documentation = "https://github.com/skyler-myers-db/activemq-pyspark-connector#readme"
+Changelog = "https://github.com/skyler-myers-db/activemq-pyspark-connector/releases"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+activemq_pyspark = ["py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "stomp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pyspark.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
