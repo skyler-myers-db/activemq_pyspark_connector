@@ -70,7 +70,7 @@ query = (
 | `queues`            | `list[str]`                   | Yes      | A string representation of a list of queue names to subscribe to.                                       |
 | `username`          | `str`                              | No       | The username for authentication.                                                                        |
 | `password`          | `str`                              | No       | The password for authentication.                                                                        |
-| `heartbeats`          | `int`                              | No       | How often (in milliseconds) to send client heartbeats to the server                                                                   |
+| `heartbeats`        | `int`                              | No       | How often (in milliseconds) to send client heartbeats to the server. Default: 3000 (3 seconds)                                                                   |
 
 ### Output Schema
 
