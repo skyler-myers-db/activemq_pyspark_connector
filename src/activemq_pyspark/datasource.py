@@ -253,8 +253,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_error(self, frame: stomp.utils.Frame) -> None:
         """Handle broker error messages."""
-        error_msg = frame.body if frame.body else "Unknown error"
-        print(f"{self._get_est_timestamp()}: ERROR: Received broker error: {error_msg}")
+        print(f"{self._get_est_timestamp()}: ERROR: Received broker error: {frame}")
 
     def on_disconnected(self) -> None:
         """Handle broker disconnection with exponential backoff reconnection strategy."""
