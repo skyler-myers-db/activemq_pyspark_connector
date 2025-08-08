@@ -170,7 +170,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             self._options.get("debug_print_frames", "false")
         ).lower() in {"1", "true", "yes", "y"}
         self._health_log_interval_sec: int = int(
-            self._options.get("health_log_interval_sec", "60")
+            self._options.get("health_log_interval_sec", "0")
         )
         self._current_offset: int = 0
         self._last_committed_offset: int = 0
@@ -275,7 +275,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_connected(self, frame: stomp.utils.Frame) -> None:
         """Handle successful broker connection."""
-        # Print once with timestamp for visibility on the driver
+        # Print once with timestamp for visibility on the driver (rare event)
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         print(
             f"[{ts}] on_connected: {_safe_frame_str(frame)}",
@@ -414,13 +414,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         """Process incoming ActiveMQ messages with hybrid storage approach."""
         # Update last message timestamp and optionally print full frame when debug enabled
         self._last_message_ts = time.time()
-        if self._debug_print_frames:
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(
-                f"[{ts}] on_message: {_safe_frame_str(frame)}",
-                file=sys.stderr,
-                flush=True,
-            )
+        # Intentionally avoid per-message prints to prevent stderr flooding
         if self._shutdown_event.is_set():
             return
 
