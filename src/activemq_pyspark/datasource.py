@@ -54,11 +54,11 @@ _log = logging.getLogger(__name__)
 # Ensure this module logs to stderr if no handlers are configured (common on Databricks)
 if not _log.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setLevel(logging.INFO)
+    _handler.setLevel(logging.WARNING)
     _formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
     _handler.setFormatter(_formatter)
     _log.addHandler(_handler)
-    _log.setLevel(logging.INFO)
+    _log.setLevel(logging.WARNING)
     # Allow messages to propagate to root handlers managed by Spark/Databricks
     _log.propagate = True
 
@@ -165,6 +165,13 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._manual_keepalive_interval_ms: int = int(
             self._options.get("manual_keepalive_interval_ms", "200")
         )
+        # Debug/health controls
+        self._debug_print_frames: bool = str(
+            self._options.get("debug_print_frames", "false")
+        ).lower() in {"1", "true", "yes", "y"}
+        self._health_log_interval_sec: int = int(
+            self._options.get("health_log_interval_sec", "60")
+        )
         self._current_offset: int = 0
         self._last_committed_offset: int = 0
         self._messages_deque: deque[tuple] = deque(maxlen=self.MAX_MESSAGES_BUFFER)
@@ -174,6 +181,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._reconnect_count: int = 0
         self._keepalive_thread: Thread | None = None
         self._keepalive_running: Event = Event()
+        self._health_thread: Thread | None = None
+        self._health_running: Event = Event()
+        self._last_heartbeat_ts: float = 0.0
+        self._last_message_ts: float = 0.0
         self._connect_and_subscribe()
 
     def _connect_and_subscribe(self) -> None:
@@ -215,6 +226,11 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 self._keepalive_thread is None or not self._keepalive_thread.is_alive()
             ):
                 self._start_keepalive_loop()
+            # Start health reporter if enabled
+            if self._health_log_interval_sec > 0 and (
+                self._health_thread is None or not self._health_thread.is_alive()
+            ):
+                self._start_health_loop()
 
         except (stomp.exception.ConnectFailedException, ConnectionError) as e:
             _log.error("Failed to connect to broker: %s", e)
@@ -233,6 +249,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             "_shutdown_event",
             "_keepalive_thread",
             "_keepalive_running",
+            "_health_thread",
+            "_health_running",
         ]
         for key in non_serializable:
             if key in state:
@@ -248,13 +266,22 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._keepalive_thread = None
         self._keepalive_running = Event()
         self._last_committed_offset = getattr(self, "_last_committed_offset", 0)
+        self._health_thread = None
+        self._health_running = Event()
+        self._last_heartbeat_ts = getattr(self, "_last_heartbeat_ts", 0.0)
+        self._last_message_ts = getattr(self, "_last_message_ts", 0.0)
         self._reconnect_count = 0
         self._connect_and_subscribe()
 
     def on_connected(self, frame: stomp.utils.Frame) -> None:
         """Handle successful broker connection."""
-        # Always print the full frame for visibility on the driver
-        print(f"on_connected: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
+        # Print once with timestamp for visibility on the driver
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(
+            f"[{ts}] on_connected: {_safe_frame_str(frame)}",
+            file=sys.stderr,
+            flush=True,
+        )
         server_info = frame.headers.get("server", "unknown")
         server_hb = frame.headers.get("heart-beat", "unknown")
         _log.info("Connected to broker: %s", server_info)
@@ -266,6 +293,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_heartbeat(self) -> None:
         """Called by stomp.py when a heartbeat is received from the broker."""
+        # Record timestamp for health reporting
+        self._last_heartbeat_ts = time.time()
 
     # Keep silent to minimize overhead at 200ms cadence; enable if needed:
     # _log.debug("Received heartbeat from broker")
@@ -273,6 +302,12 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def on_heartbeat_timeout(self) -> None:
         """Called when broker heartbeats are not received within the expected window."""
         _log.warning("Heartbeat timeout waiting for broker heartbeats")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(
+            f"[{ts}] heartbeat_timeout: no broker heartbeat within expected window",
+            file=sys.stderr,
+            flush=True,
+        )
         # Proactive reconnect to avoid broker-side TTL disconnects
         try:
             if self._conn and self._conn.is_connected():
@@ -327,10 +362,65 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 _log.warning("Keepalive loop error: %s", e)
                 time.sleep(0.5)
 
+    # -------------------- Health reporter loop --------------------
+    def _start_health_loop(self) -> None:
+        """Start a loop that periodically prints a concise health summary."""
+        if self._health_log_interval_sec <= 0:
+            return
+        self._health_running.set()
+        self._health_thread = Thread(
+            target=self._health_loop, name="amq-health", daemon=True
+        )
+        self._health_thread.start()
+
+    def _health_loop(self) -> None:
+        interval = float(max(1, int(self._health_log_interval_sec)))
+        while not self._shutdown_event.is_set() and self._health_running.is_set():
+            try:
+                now = time.time()
+                since_hb = (
+                    (now - self._last_heartbeat_ts) if self._last_heartbeat_ts else None
+                )
+                since_msg = (
+                    (now - self._last_message_ts) if self._last_message_ts else None
+                )
+                conn_state = (
+                    "connected"
+                    if (self._conn and self._conn.is_connected())
+                    else "disconnected"
+                )
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+                hb_s = f"{since_hb:.3f}s" if since_hb is not None else "n/a"
+                msg_s = f"{since_msg:.3f}s" if since_msg is not None else "n/a"
+                print(
+                    f"[{ts}] health: hb_since={hb_s} msg_since={msg_s} state={conn_state} queued={len(self._messages_deque)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # Sleep in small chunks to be interruptible
+                slept = 0.0
+                while (
+                    slept < interval
+                    and not self._shutdown_event.is_set()
+                    and self._health_running.is_set()
+                ):
+                    time.sleep(0.2)
+                    slept += 0.2
+            except (OSError, IOError, ConnectionError, RuntimeError, ValueError) as e:
+                _log.debug("Health loop transient error: %s", e)
+                time.sleep(1)
+
     def on_message(self, frame: stomp.utils.Frame) -> None:
         """Process incoming ActiveMQ messages with hybrid storage approach."""
-        # Always print the full frame for visibility on the driver
-        print(f"on_message: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
+        # Update last message timestamp and optionally print full frame when debug enabled
+        self._last_message_ts = time.time()
+        if self._debug_print_frames:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(
+                f"[{ts}] on_message: {_safe_frame_str(frame)}",
+                file=sys.stderr,
+                flush=True,
+            )
         if self._shutdown_event.is_set():
             return
 
@@ -379,8 +469,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_error(self, frame: stomp.utils.Frame) -> None:
         """Handle broker error messages."""
-        # Always print the full frame for visibility on the driver
-        print(f"on_error: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"[{ts}] on_error: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
         _log.error("Received broker error from broker: %s", _safe_frame_str(frame))
 
     def on_disconnected(self) -> None:
@@ -388,6 +478,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         if self._shutdown_event.is_set():
             return
         _log.error("Disconnected from broker. Attempting to reconnect…")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(
+            f"[{ts}] disconnected: attempting to reconnect", file=sys.stderr, flush=True
+        )
 
         while not self._shutdown_event.is_set() and (
             self.MAX_RECONNECT_ATTEMPTS == 0
@@ -409,6 +503,12 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                     self._connect_and_subscribe()
                     if self._conn and self._conn.is_connected():
                         _log.info("Reconnected to broker")
+                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                        print(
+                            f"[{ts}] reconnected: broker connection restored",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         return
 
             except (stomp.exception.ConnectFailedException, ConnectionError) as e:
@@ -422,8 +522,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             self._reconnect_count >= self.MAX_RECONNECT_ATTEMPTS
         ):
             _log.error(
-                "Failed to reconnect after %s attempts",
-                self.MAX_RECONNECT_ATTEMPTS,
+                "Failed to reconnect after %s attempts", self.MAX_RECONNECT_ATTEMPTS
             )
             self._shutdown_event.set()
 
@@ -518,6 +617,14 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             time.sleep(0.1)
             try:
                 self._keepalive_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
+        # Stop health loop
+        self._health_running.clear()
+        if self._health_thread and self._health_thread.is_alive():
+            time.sleep(0.1)
+            try:
+                self._health_thread.join(timeout=1.0)
             except RuntimeError:
                 pass
         if self._conn and self._conn.is_connected():
