@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "activemq-pyspark-connector"
-version = "1.0.5"
+version = "1.0.6"
 description = "A high-performance PySpark streaming data source for ActiveMQ with TTL protection and hybrid memory management."
 readme = "README.md"
 requires-python = ">=3.10.12"

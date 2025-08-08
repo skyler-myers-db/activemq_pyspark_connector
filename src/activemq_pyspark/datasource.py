@@ -62,9 +62,7 @@ from pyspark.sql.types import (
 class ActiveMQPartition(InputPartition):
     """Represents a partition of ActiveMQ messages for parallel processing."""
 
-    def __init__(
-        self, start_offset: int, end_offset: int, messages: list[tuple], lock: Lock
-    ):
+    def __init__(self, start_offset: int, end_offset: int, messages: list[tuple]):
         partition_info = {
             "start_offset": start_offset,
             "end_offset": end_offset,
@@ -74,7 +72,6 @@ class ActiveMQPartition(InputPartition):
         self.start_offset: int = start_offset
         self.end_offset: int = end_offset
         self._messages: list[tuple] = messages
-        self._lock: Lock = lock
 
     def read(self) -> Iterator[tuple]:
         """Required interface method for reading partition data."""
@@ -82,14 +79,11 @@ class ActiveMQPartition(InputPartition):
             yield message
 
     def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        if "_lock" in state:
-            del state["_lock"]
-        return state
+        # Partition only carries simple, picklable data
+        return {k: v for k, v in self.__dict__.items() if k != "_lock"}
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
-        self._lock = Lock()
 
 
 class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
@@ -192,7 +186,14 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def __getstate__(self) -> dict:
         """Prepare object for serialization by removing non-serializable objects."""
         state: dict = self.__dict__.copy()
-        non_serializable = ["_lock", "_conn", "_shutdown_event"]
+        # Remove all threading primitives and connection objects that are not picklable
+        non_serializable = [
+            "_lock",
+            "_conn",
+            "_shutdown_event",
+            "_keepalive_thread",
+            "_keepalive_running",
+        ]
         for key in non_serializable:
             if key in state:
                 del state[key]
@@ -204,6 +205,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._lock = Lock()
         self._conn = None
         self._shutdown_event = Event()
+        self._keepalive_thread = None
+        self._keepalive_running = Event()
         self._reconnect_count = 0
         self._connect_and_subscribe()
 
@@ -381,7 +384,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
         if end_offset <= start_offset:
             _log.debug("No new messages, returning empty partition")
-            return [ActiveMQPartition(start_offset, start_offset, [], self._lock)]
+            return [ActiveMQPartition(start_offset, start_offset, [])]
 
         with self._lock:
             partition_data = [
@@ -391,9 +394,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             ]
 
         if len(partition_data) <= 100:
-            partitions = [
-                ActiveMQPartition(start_offset, end_offset, partition_data, self._lock)
-            ]
+            partitions = [ActiveMQPartition(start_offset, end_offset, partition_data)]
         else:
             num_partitions = min(8, len(partition_data) // 50)
             chunk_size = len(partition_data) // num_partitions
@@ -416,7 +417,6 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                             chunk_start_offset,
                             chunk_end_offset,
                             chunk_data,
-                            self._lock,
                         )
                     )
 
