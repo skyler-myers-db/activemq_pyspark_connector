@@ -49,13 +49,13 @@ Dependencies:
     - pytz: Timezone handling for logging
 """
 
-from typing import Iterator
+from typing import Iterator, Final
 from ast import literal_eval
 from collections import deque
 from threading import Lock, Event
 from datetime import datetime
 from pytz import timezone
-import stomp  # type: ignore
+import stomp
 
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
@@ -110,10 +110,10 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     Features TTL protection via 2-second heartbeats and exponential backoff reconnection.
     """
 
-    MAX_MESSAGES_BUFFER: int = 15000
-    HEARTBEAT_INTERVAL: int = 2000
-    RECONNECT_DELAY: int = 2
-    MAX_RECONNECT_ATTEMPTS: int = 5
+    MAX_MESSAGES_BUFFER: Final[int] = 15_000
+    HEARTBEAT_INTERVAL: Final[int] = 500
+    RECONNECT_DELAY: Final[int] = 2
+    MAX_RECONNECT_ATTEMPTS: Final[int] = 5
 
     def __init__(self, schema: StructType, options: dict[str, str]) -> None:
         stomp.ConnectionListener.__init__(self)
@@ -214,8 +214,22 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     def on_connected(self, frame: stomp.utils.Frame) -> None:
         """Handle successful broker connection."""
         server_info = frame.headers.get("server", "unknown")
+        server_hb = frame.headers.get("heart-beat", "unknown")
         print(
             f"{self._get_est_timestamp()}: SUCCESS: Connected to broker: {server_info}"
+        )
+        print(
+            f"{self._get_est_timestamp()}: INFO: Heartbeat negotiation -> client: {self._heartbeats}ms, server advertises: {server_hb}"
+        )
+
+    def on_heartbeat(self) -> None:
+        """Called by stomp.py when a heartbeat is received from the broker."""
+        print(f"{self._get_est_timestamp()}: DEBUG: Received heartbeat from broker")
+
+    def on_heartbeat_timeout(self) -> None:
+        """Called when broker heartbeats are not received within the expected window."""
+        print(
+            f"{self._get_est_timestamp()}: WARN: Heartbeat timeout waiting for broker heartbeats"
         )
 
     def on_message(self, frame: stomp.utils.Frame) -> None:
@@ -425,7 +439,7 @@ class ActiveMQDataSource(DataSource):
             ]
         )
 
-    def reader(self, schema: StructType):
+    def reader(self, schema: StructType) -> ActiveMQStreamReader:
         """Batch reading is not supported for ActiveMQ data source."""
         raise NotImplementedError(
             "ERROR: Batch queries are not supported for ActiveMQDataSource."
