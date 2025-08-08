@@ -1,37 +1,28 @@
 """
 PySpark DataSource implementation for streaming ActiveMQ messages using STOMP protocol.
 
-This module provides a comprehensive streaming interface for consuming messages from
-ActiveMQ brokers with optimized memory management, automatic reconnection, and parallel
-processing capabilities.
+This module provides a streaming interface for consuming messages from ActiveMQ brokers
+with optimized memory management, automatic reconnection, and parallel processing.
 
 Classes:
     ActiveMQPartition: Represents a partition of ActiveMQ messages for parallel processing.
-        Handles message batches with thread-safe serialization/deserialization.
-
-    ActiveMQStreamReader: Main stream reader implementing PySpark's DataSourceStreamReader
-        and STOMP ConnectionListener interfaces. Features:
-        - Hybrid deque/dict memory management for bounded memory usage
-        - TTL protection via configurable heartbeats (default 2s)
-        - Exponential backoff reconnection strategy
-        - Thread-safe message buffering with configurable limits
-        - Automatic offset tracking and partition creation
-
-    ActiveMQDataSource: PySpark DataSource entry point for ActiveMQ integration.
-        Registers as 'activemq' data source and provides streaming capabilities only.
+    ActiveMQStreamReader: PySpark DataSourceStreamReader and STOMP ConnectionListener implementation.
+    ActiveMQDataSource: PySpark DataSource entry point for ActiveMQ integration (streaming only).
 
 Key Features:
-    - Memory Management: Bounded buffer (15,000 messages) with automatic eviction
-    - Fault Tolerance: Auto-reconnection with exponential backoff up to 5 attempts
-    - Performance: O(1) message append and offset-based lookups
-    - Monitoring: EST timestamp logging for connection events and errors
-    - Serialization: Safe pickle support for Spark executor distribution
+    - Memory: Bounded buffer (15,000 msgs) via deque + dict hybrid
+    - Fault tolerance: Auto-reconnect with exponential backoff (unlimited attempts)
+    - Performance: O(1) message append and offset lookups
+    - Monitoring: Lightweight stdlib logging for connection events and errors
+    - TTL protection: 200ms heartbeats + manual keepalive loop
 
 Configuration Options:
     - hosts_and_ports: List of broker endpoints (default: [('localhost', 61613)])
     - queues: List of queue names to subscribe to
     - username/password: Authentication credentials (default: admin/password)
-    - heartbeats: Heartbeat interval in milliseconds (default: 2000)
+    - heartbeats: Heartbeat interval in milliseconds (default: 200)
+    - enable_manual_keepalive: Enable client-side keepalive (default: true)
+    - manual_keepalive_interval_ms: Interval for keepalive loop (default: 200)
 
 Schema:
     - offset: Integer message offset for ordering
@@ -46,16 +37,18 @@ Usage:
 Dependencies:
     - pyspark: Core Spark functionality
     - stomp.py: STOMP protocol implementation
-    - pytz: Timezone handling for logging
+    - logging: Standard library logging
 """
 
+import time
 from typing import Iterator, Final
 from ast import literal_eval
 from collections import deque
-from threading import Lock, Event
-from datetime import datetime
-from pytz import timezone
+from threading import Lock, Event, Thread
+import logging
 import stomp
+
+_log = logging.getLogger(__name__)
 
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
@@ -107,13 +100,14 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
     - Deque: Bounded memory with automatic eviction (O(1) append)
     - Dict: Fast offset-based lookups for partition creation (O(1) access)
 
-    Features TTL protection via 2-second heartbeats and exponential backoff reconnection.
+    Features TTL protection via 200ms heartbeats and exponential backoff reconnection.
     """
 
     MAX_MESSAGES_BUFFER: Final[int] = 15_000
-    HEARTBEAT_INTERVAL: Final[int] = 500
+    HEARTBEAT_INTERVAL: Final[int] = 200
     RECONNECT_DELAY: Final[int] = 2
-    MAX_RECONNECT_ATTEMPTS: Final[int] = 5
+    # 0 => unlimited reconnect attempts
+    MAX_RECONNECT_ATTEMPTS: Final[int] = 0
 
     def __init__(self, schema: StructType, options: dict[str, str]) -> None:
         stomp.ConnectionListener.__init__(self)
@@ -130,6 +124,13 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._broker_queues: list[str] = literal_eval(self._options["queues"])
         self._username: str = self._options.get("username", "admin")
         self._password: str = self._options.get("password", "password")
+        # Manual keepalive settings (client-side only)
+        self._enable_manual_keepalive: bool = str(
+            self._options.get("enable_manual_keepalive", "true")
+        ).lower() in {"1", "true", "yes", "y"}
+        self._manual_keepalive_interval_ms: int = int(
+            self._options.get("manual_keepalive_interval_ms", "200")
+        )
 
         self._current_offset: int = 0
         self._messages_deque: deque[tuple] = deque(maxlen=self.MAX_MESSAGES_BUFFER)
@@ -137,12 +138,9 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._lock: Lock = Lock()
         self._shutdown_event: Event = Event()
         self._reconnect_count: int = 0
+        self._keepalive_thread: Thread | None = None
+        self._keepalive_running: Event = Event()
         self._connect_and_subscribe()
-
-    def _get_est_timestamp(self) -> str:
-        """Get current EST timestamp for logging."""
-        est = timezone("America/New_York")
-        return datetime.now(est).strftime("%Y-%m-%d %H:%M:%S EST")
 
     def _connect_and_subscribe(self) -> None:
         """Connects to the broker and subscribes to queues with comprehensive error handling."""
@@ -158,9 +156,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 )
                 self._conn.set_listener("ActiveMQReaderListener", self)
 
-            print(
-                f"{self._get_est_timestamp()}: INFO: Attempting to connect to broker..."
-            )
+            _log.info("Attempting to connect to broker…")
             self._conn.connect(
                 self._username,
                 self._password,
@@ -172,9 +168,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             )
 
             for idx, queue in enumerate(self._broker_queues, start=1):
-                print(
-                    f"{self._get_est_timestamp()}: INFO: Attempting to subscribe to queue: '{queue}' with ID: '{idx}'"
-                )
+                _log.info("Subscribing to queue '%s' with id '%s'", queue, idx)
                 self._conn.subscribe(
                     destination=queue,
                     id=str(idx),
@@ -182,15 +176,17 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
                 )
             self._reconnect_count = 0
 
+            # Start/ensure keepalive thread is running
+            if self._enable_manual_keepalive and (
+                self._keepalive_thread is None or not self._keepalive_thread.is_alive()
+            ):
+                self._start_keepalive_loop()
+
         except (stomp.exception.ConnectFailedException, ConnectionError) as e:
-            print(
-                f"{self._get_est_timestamp()}: ERROR: Failed to connect to broker: {e}"
-            )
+            _log.error("Failed to connect to broker: %s", e)
             raise
         except (OSError, IOError) as e:
-            print(
-                f"{self._get_est_timestamp()}: ERROR: Network error during connection: {e}"
-            )
+            _log.error("Network error during connection: %s", e)
             raise
 
     def __getstate__(self) -> dict:
@@ -215,22 +211,75 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         """Handle successful broker connection."""
         server_info = frame.headers.get("server", "unknown")
         server_hb = frame.headers.get("heart-beat", "unknown")
-        print(
-            f"{self._get_est_timestamp()}: SUCCESS: Connected to broker: {server_info}"
-        )
-        print(
-            f"{self._get_est_timestamp()}: INFO: Heartbeat negotiation -> client: {self._heartbeats}ms, server advertises: {server_hb}"
+        _log.info("Connected to broker: %s", server_info)
+        _log.info(
+            "Heartbeat negotiation -> client: %sms, server advertises: %s",
+            self._heartbeats,
+            server_hb,
         )
 
     def on_heartbeat(self) -> None:
         """Called by stomp.py when a heartbeat is received from the broker."""
-        print(f"{self._get_est_timestamp()}: DEBUG: Received heartbeat from broker")
+
+    # Keep silent to minimize overhead at 200ms cadence; enable if needed:
+    # _log.debug("Received heartbeat from broker")
 
     def on_heartbeat_timeout(self) -> None:
         """Called when broker heartbeats are not received within the expected window."""
-        print(
-            f"{self._get_est_timestamp()}: WARN: Heartbeat timeout waiting for broker heartbeats"
+        _log.warning("Heartbeat timeout waiting for broker heartbeats")
+        # Proactive reconnect to avoid broker-side TTL disconnects
+        try:
+            if self._conn and self._conn.is_connected():
+                self._conn.disconnect()
+        except (
+            stomp.exception.ConnectFailedException,
+            ConnectionError,
+            OSError,
+            IOError,
+        ) as e:
+            _log.warning("Disconnect on heartbeat timeout failed: %s", e)
+        # Reset reconnect state and attempt immediate reconnect
+        self._reconnect_count = 0
+        self._connect_and_subscribe()
+
+    # -------------------- Manual keepalive loop --------------------
+    def _start_keepalive_loop(self) -> None:
+        """Start a lightweight loop that sends benign frames to keep the TCP connection active."""
+        self._keepalive_running.set()
+        self._keepalive_thread = Thread(
+            target=self._keepalive_loop, name="amq-keepalive", daemon=True
         )
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self) -> None:
+        interval = max(100, self._manual_keepalive_interval_ms)
+        while not self._shutdown_event.is_set() and self._keepalive_running.is_set():
+            try:
+                # Send a BEGIN/ABORT transaction pair as a harmless no-op if connected
+                if self._conn and self._conn.is_connected():
+                    tx_id = f"ka-{time.time_ns()}"
+                    try:
+                        self._conn.begin(transaction=tx_id)
+                        self._conn.abort(transaction=tx_id)
+                    except (
+                        stomp.exception.ConnectFailedException,
+                        ConnectionError,
+                        OSError,
+                        IOError,
+                    ) as e:
+                        _log.warning("Keepalive send failed: %s", e)
+                # Sleep in small chunks to be interruptible
+                slept = 0
+                while (
+                    slept < interval
+                    and not self._shutdown_event.is_set()
+                    and self._keepalive_running.is_set()
+                ):
+                    time.sleep(0.05)
+                    slept += 50
+            except (OSError, IOError, ConnectionError) as e:
+                _log.warning("Keepalive loop error: %s", e)
+                time.sleep(0.5)
 
     def on_message(self, frame: stomp.utils.Frame) -> None:
         """Process incoming ActiveMQ messages with hybrid storage approach."""
@@ -267,50 +316,50 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_error(self, frame: stomp.utils.Frame) -> None:
         """Handle broker error messages."""
-        print(f"{self._get_est_timestamp()}: ERROR: Received broker error: {frame}")
+
+    _log.error("Received broker error from broker")
 
     def on_disconnected(self) -> None:
         """Handle broker disconnection with exponential backoff reconnection strategy."""
         if self._shutdown_event.is_set():
             return
+        _log.error("Disconnected from broker. Attempting to reconnect…")
 
-        print(
-            f"{self._get_est_timestamp()}: ERROR: Disconnected from broker. Attempting to reconnect..."
-        )
-
-        while (
-            not self._shutdown_event.is_set()
-            and self._reconnect_count < self.MAX_RECONNECT_ATTEMPTS
+        while not self._shutdown_event.is_set() and (
+            self.MAX_RECONNECT_ATTEMPTS == 0
+            or self._reconnect_count < self.MAX_RECONNECT_ATTEMPTS
         ):
             try:
                 self._reconnect_count += 1
                 delay = min(
                     self.RECONNECT_DELAY * (2 ** (self._reconnect_count - 1)), 60
                 )
-                print(
-                    f"{self._get_est_timestamp()}: Reconnect attempt {self._reconnect_count}/{self.MAX_RECONNECT_ATTEMPTS} in {delay}s"
+                _log.info(
+                    "Reconnect attempt %s/%s in %ss",
+                    self._reconnect_count,
+                    self.MAX_RECONNECT_ATTEMPTS,
+                    delay,
                 )
 
                 if not self._shutdown_event.wait(delay):
                     self._connect_and_subscribe()
                     if self._conn and self._conn.is_connected():
-                        print(
-                            f"{self._get_est_timestamp()}: SUCCESS: Reconnected to broker"
-                        )
+                        _log.info("Reconnected to broker")
                         return
 
             except (stomp.exception.ConnectFailedException, ConnectionError) as e:
-                print(
-                    f"{self._get_est_timestamp()}: Reconnect attempt {self._reconnect_count} failed: {e}"
+                _log.warning(
+                    "Reconnect attempt %s failed: %s", self._reconnect_count, e
                 )
             except (OSError, IOError) as e:
-                print(
-                    f"{self._get_est_timestamp()}: Network error during reconnect: {e}"
-                )
+                _log.warning("Network error during reconnect: %s", e)
 
-        if self._reconnect_count >= self.MAX_RECONNECT_ATTEMPTS:
-            print(
-                f"{self._get_est_timestamp()}: ERROR: Failed to reconnect after {self.MAX_RECONNECT_ATTEMPTS} attempts"
+        if self.MAX_RECONNECT_ATTEMPTS and (
+            self._reconnect_count >= self.MAX_RECONNECT_ATTEMPTS
+        ):
+            _log.error(
+                "Failed to reconnect after %s attempts",
+                self.MAX_RECONNECT_ATTEMPTS,
             )
             self._shutdown_event.set()
 
@@ -331,9 +380,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         end_offset: int = end.get("offset", self._current_offset)
 
         if end_offset <= start_offset:
-            print(
-                f"{self._get_est_timestamp()}: INFO: No new messages, returning empty partition."
-            )
+            _log.debug("No new messages, returning empty partition")
             return [ActiveMQPartition(start_offset, start_offset, [], self._lock)]
 
         with self._lock:
@@ -404,8 +451,16 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def stop(self) -> None:
         """Stop the reader and cleanup all resources."""
-        print(f"{self._get_est_timestamp()}: ActiveMQ Stream Reader stopping...")
-
+        _log.info("ActiveMQ Stream Reader stopping…")
+        # Stop keepalive loop
+        self._keepalive_running.clear()
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            # Give it a moment to exit
+            time.sleep(0.1)
+            try:
+                self._keepalive_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
         if self._conn and self._conn.is_connected():
             self._conn.disconnect()
 
