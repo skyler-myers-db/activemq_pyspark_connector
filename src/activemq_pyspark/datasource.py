@@ -89,6 +89,7 @@ def _safe_frame_str(frame: object) -> str:
 
     return f"cmd={cmd} headers={headers_str} body={body_str}"
 
+
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
     StructType,
