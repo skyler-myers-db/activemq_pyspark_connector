@@ -51,14 +51,43 @@ import logging
 import stomp
 
 _log = logging.getLogger(__name__)
-# Ensure this module logs to stdout if no handlers are configured (common on Databricks)
+# Ensure this module logs to stderr if no handlers are configured (common on Databricks)
 if not _log.handlers:
-    _handler = logging.StreamHandler(sys.stdout)
+    _handler = logging.StreamHandler(sys.stderr)
     _handler.setLevel(logging.INFO)
     _formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
     _handler.setFormatter(_formatter)
     _log.addHandler(_handler)
     _log.setLevel(logging.INFO)
+    # Allow messages to propagate to root handlers managed by Spark/Databricks
+    _log.propagate = True
+
+
+def _safe_frame_str(frame: object) -> str:
+    """Return a robust string representation of a STOMP frame for debugging/printing."""
+    cmd = getattr(frame, "cmd", None)
+    headers = getattr(frame, "headers", None)
+    body = getattr(frame, "body", None)
+
+    # Headers string
+    if isinstance(headers, dict):
+        try:
+            headers_str = json.dumps(headers, separators=(",", ":"))
+        except (TypeError, ValueError):
+            headers_str = str(headers)
+    else:
+        headers_str = str(headers)
+
+    # Body string
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body_str = body.decode("utf-8", errors="replace")
+        except UnicodeDecodeError:
+            body_str = "<unprintable body>"
+    else:
+        body_str = str(body)
+
+    return f"cmd={cmd} headers={headers_str} body={body_str}"
 
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
@@ -223,6 +252,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_connected(self, frame: stomp.utils.Frame) -> None:
         """Handle successful broker connection."""
+        # Always print the full frame for visibility on the driver
+        print(f"on_connected: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
         server_info = frame.headers.get("server", "unknown")
         server_hb = frame.headers.get("heart-beat", "unknown")
         _log.info("Connected to broker: %s", server_info)
@@ -297,6 +328,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_message(self, frame: stomp.utils.Frame) -> None:
         """Process incoming ActiveMQ messages with hybrid storage approach."""
+        # Always print the full frame for visibility on the driver
+        print(f"on_message: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
         if self._shutdown_event.is_set():
             return
 
@@ -345,8 +378,9 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
 
     def on_error(self, frame: stomp.utils.Frame) -> None:
         """Handle broker error messages."""
-
-    _log.error("Received broker error from broker")
+        # Always print the full frame for visibility on the driver
+        print(f"on_error: {_safe_frame_str(frame)}", file=sys.stderr, flush=True)
+        _log.error("Received broker error from broker: %s", _safe_frame_str(frame))
 
     def on_disconnected(self) -> None:
         """Handle broker disconnection with exponential backoff reconnection strategy."""
