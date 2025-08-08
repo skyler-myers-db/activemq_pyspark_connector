@@ -41,6 +41,8 @@ Dependencies:
 """
 
 import time
+import sys
+import json
 from typing import Iterator, Final
 from ast import literal_eval
 from collections import deque
@@ -49,6 +51,14 @@ import logging
 import stomp
 
 _log = logging.getLogger(__name__)
+# Ensure this module logs to stdout if no handlers are configured (common on Databricks)
+if not _log.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setLevel(logging.INFO)
+    _formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    _handler.setFormatter(_formatter)
+    _log.addHandler(_handler)
+    _log.setLevel(logging.INFO)
 
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
@@ -125,8 +135,8 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._manual_keepalive_interval_ms: int = int(
             self._options.get("manual_keepalive_interval_ms", "200")
         )
-
         self._current_offset: int = 0
+        self._last_committed_offset: int = 0
         self._messages_deque: deque[tuple] = deque(maxlen=self.MAX_MESSAGES_BUFFER)
         self._messages_dict: dict[int, tuple] = {}
         self._lock: Lock = Lock()
@@ -207,6 +217,7 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         self._shutdown_event = Event()
         self._keepalive_thread = None
         self._keepalive_running = Event()
+        self._last_committed_offset = getattr(self, "_last_committed_offset", 0)
         self._reconnect_count = 0
         self._connect_and_subscribe()
 
@@ -290,19 +301,34 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
             return
 
         try:
+            # Serialize headers/body to strings to reduce object overhead and match schema
+            if hasattr(frame, "headers") and isinstance(frame.headers, dict):
+                headers_str = json.dumps(frame.headers, separators=(",", ":"))
+            else:
+                headers_str = str(getattr(frame, "headers", {}))
+
+            body_val = getattr(frame, "body", "")
+            if isinstance(body_val, (bytes, bytearray)):
+                try:
+                    body_str = body_val.decode("utf-8", errors="replace")
+                except UnicodeDecodeError:
+                    body_str = str(body_val)
+            else:
+                body_str = str(body_val)
+
             message_tuple: tuple = (
                 self._current_offset,
                 frame.cmd,
-                frame.headers,
-                frame.body,
+                headers_str,
+                body_str,
                 None,
             )
         except (AttributeError, KeyError) as e:
             message_tuple = (
                 self._current_offset,
                 frame.cmd if hasattr(frame, "cmd") else "ERROR",
-                frame.headers if hasattr(frame, "headers") else {},
-                frame.body if hasattr(frame, "body") else "",
+                str(getattr(frame, "headers", {})),
+                str(getattr(frame, "body", "")),
                 f"Message processing error: {str(e)}",
             )
 
@@ -423,21 +449,19 @@ class ActiveMQStreamReader(DataSourceStreamReader, stomp.ConnectionListener):
         return partitions
 
     def commit(self, end: dict[str, int]) -> None:
-        """Remove committed messages from hybrid storage structures."""
+        """Remove committed messages from hybrid storage structures (O(delta))."""
         commit_offset: int = end.get("offset", 0)
-
         with self._lock:
-            committed_offsets = [
-                offset for offset in self._messages_dict if offset < commit_offset
-            ]
-            for offset in committed_offsets:
-                self._messages_dict.pop(offset, None)
-
-            remaining_messages = [
-                msg for msg in self._messages_deque if msg[0] >= commit_offset
-            ]
-            self._messages_deque.clear()
-            self._messages_deque.extend(remaining_messages)
+            start = self._last_committed_offset
+            if commit_offset <= start:
+                return
+            # Drop dict entries in the committed range
+            for off in range(start, commit_offset):
+                self._messages_dict.pop(off, None)
+            # Incrementally pop from the left of the deque
+            while self._messages_deque and self._messages_deque[0][0] < commit_offset:
+                self._messages_deque.popleft()
+            self._last_committed_offset = commit_offset
 
     def read(self, partition: InputPartition) -> Iterator[tuple]:
         """Read data from the partition using the restored interface."""
